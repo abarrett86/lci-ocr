@@ -1,0 +1,7 @@
+# heroku.yml
+build:
+  docker:
+    web: Dockerfile   # use the Dockerfile already in your repo
+# (Optional) If you want to override CMD from the Dockerfile:
+# run:
+#   web: uvicorn app:app --host 0.0.0.0 --port ${PORT}
