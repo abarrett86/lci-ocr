@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from PIL import Image
 import numpy as np
 from paddleocr import PaddleOCR
+from fastapi.middleware.cors import CORSMiddleware
 
 import fitz  # PyMuPDF
 
