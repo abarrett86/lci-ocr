@@ -16,6 +16,13 @@ ocr = PaddleOCR(use_angle_cls=USE_ANGLE_CLS, lang=LANG)
 
 app = FastAPI(title="PaddleOCR REST", version="1.0.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or restrict to your n8n URL, e.g. "https://n8n.yourdomain.com"
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 class UrlPayload(BaseModel):
     url: str
     det: Optional[bool] = True
