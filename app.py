@@ -104,18 +104,20 @@ def _run_ocr(img: Image.Image, det=True, rec=True, cls=USE_ANGLE_CLS):
 @app.post("/ocr")
 async def ocr_endpoint(
     request: Request,
+    # keep the explicit field for normal clients
     image: Optional[UploadFile] = File(default=None),
     url: Optional[str] = Form(default=None),
     det: Optional[bool] = Form(default=True),
     rec: Optional[bool] = Form(default=True),
     cls: Optional[bool] = Form(default=USE_ANGLE_CLS),
-    # PDF controls (optional)
-    page: Optional[int] = Form(default=None, description="1-based page number; if omitted, processes all pages"),
-    max_pages: Optional[int] = Form(default=None, description="Limit how many pages to process (from start)"),
-    dpi: Optional[int] = Form(default=180, description="Render DPI for PDF pages"),
+    page: Optional[int] = Form(default=None),
+    max_pages: Optional[int] = Form(default=None),
+    dpi: Optional[int] = Form(default=180),
 ):
-    # Allow JSON body for URL mode
-    if image is None and url is None and request.headers.get("content-type","").startswith("application/json"):
+    ct = (request.headers.get("content-type") or "").lower()
+
+    # 1) JSON mode (URL)
+    if image is None and "application/json" in ct:
         data = await request.json()
         url = data.get("url")
         det = data.get("det", det)
@@ -125,32 +127,59 @@ async def ocr_endpoint(
         max_pages = data.get("max_pages", max_pages)
         dpi = data.get("dpi", dpi)
 
-    if image is None and url is None:
-        raise HTTPException(status_code=400, detail="Provide image file or url")
+    # 2) Multipart with arbitrary field name (e.g., "data" in n8n)
+    uf: Optional[UploadFile] = image
+    if uf is None and "multipart/form-data" in ct:
+        form = await request.form()
+        # try common names first
+        for key in ("image", "file", "data", "upload"):
+            if key in form and isinstance(form[key], UploadFile):
+                uf = form[key]  # type: ignore[assignment]
+                break
+        # else just take the first UploadFile in the form
+        if uf is None:
+            for v in form.values():
+                if isinstance(v, UploadFile):
+                    uf = v
+                    break
 
-    results = []
+    # 3) Raw body (application/pdf or image/*)
+    if uf is None and ("application/pdf" in ct or ct.startswith("image/")):
+        raw = await request.body()
+        is_pdf = "application/pdf" in ct
+        if is_pdf:
+            pil_pages = _pil_list_from_pdf_bytes(raw, dpi=dpi or 180, page=page, max_pages=max_pages)
+            pages = []
+            for idx, pil in enumerate(pil_pages, start=1 if page is None else page):
+                pages.append({"page": idx, "items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
+            return JSONResponse({"pages": pages})
+        else:
+            pil = _pil_from_bytes(raw)
+            return JSONResponse({"items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
 
-    if image is not None:
-        file_bytes = await image.read()
-        is_pdf = (image.content_type == "application/pdf") or (image.filename or "").lower().endswith(".pdf")
+    # 4) URL mode if provided via form
+    if uf is None and url:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                img_bytes = resp.read()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Failed to fetch image from URL")
+        pil = _pil_from_bytes(img_bytes)
+        return JSONResponse({"items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
+
+    # 5) Handle the UploadFile (multipart)
+    if uf is not None:
+        file_bytes = await uf.read()
+        fname = (uf.filename or "").lower()
+        is_pdf = ("application/pdf" in (uf.content_type or "").lower()) or fname.endswith(".pdf")
         if is_pdf:
             pil_pages = _pil_list_from_pdf_bytes(file_bytes, dpi=dpi or 180, page=page, max_pages=max_pages)
+            pages = []
             for idx, pil in enumerate(pil_pages, start=1 if page is None else page):
-                items = _run_ocr(pil, det=det, rec=rec, cls=cls)
-                results.append({"page": idx, "items": items})
-            return JSONResponse({"pages": results})
+                pages.append({"page": idx, "items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
+            return JSONResponse({"pages": pages})
         else:
             pil = _pil_from_bytes(file_bytes)
-            items = _run_ocr(pil, det=det, rec=rec, cls=cls)
-            return JSONResponse({"items": items})
+            return JSONResponse({"items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
 
-    # URL mode (image URLs only; if you need PDF URLs, download then use same PDF path)
-    try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            img_bytes = resp.read()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Failed to fetch image from URL")
-
-    pil = _pil_from_bytes(img_bytes)
-    items = _run_ocr(pil, det=det, rec=rec, cls=cls)
-    return JSONResponse({"items": items})
+    raise HTTPException(status_code=400, detail="No image/PDF provided (multipart, raw, or url expected)")
