@@ -1,6 +1,6 @@
 # app.py
 import io, os, json, urllib.request
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -8,6 +8,7 @@ from PIL import Image
 import numpy as np
 from paddleocr import PaddleOCR
 from fastapi.middleware.cors import CORSMiddleware
+
 
 import fitz  # PyMuPDF
 
