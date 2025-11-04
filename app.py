@@ -1,122 +1,147 @@
 # app.py
-import io, os, json, urllib.request
+import os
+import io
+import gc
+import json
+import asyncio
+import urllib.request
 from typing import Optional, List
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from PIL import Image
-import numpy as np
-from paddleocr import PaddleOCR
 from fastapi.middleware.cors import CORSMiddleware
 
-
+from PIL import Image
+import numpy as np
 import fitz  # PyMuPDF
+from paddleocr import PaddleOCR
 
+
+# ----------------------------
+# Config / globals
+# ----------------------------
 LANG = os.getenv("PADDLEOCR_LANG", "en")
-USE_ANGLE_CLS = os.getenv("PADDLEOCR_USE_ANGLE_CLS", "true").lower() == "true"
+USE_ANGLE_CLS = os.getenv("PADDLEOCR_USE_ANGLE_CLS", "false").lower() == "true"  # default off for memory
+OCR_MAX_SIDE = int(os.getenv("OCR_MAX_SIDE", "1800"))  # downscale longest edge
+OCR_CONCURRENCY = int(os.getenv("OCR_CONCURRENCY", "1"))  # 1 = safest for RAM on small dynos
 
-# Load OCR models once at startup
-ocr = PaddleOCR(use_angle_cls=USE_ANGLE_CLS, lang=LANG)
+# Limit math library threads to keep RAM/cpu stable on small dynos
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
+# Create app + CORS
 app = FastAPI(title="PaddleOCR REST", version="1.0.0")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or restrict to your n8n URL, e.g. "https://n8n.yourdomain.com"
+    allow_origins=["*"],              # tighten to your n8n origin if desired
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-class UrlPayload(BaseModel):
-    url: str
-    det: Optional[bool] = True
-    rec: Optional[bool] = True
-    cls: Optional[bool] = USE_ANGLE_CLS
+# Concurrency guard
+OCR_SEMAPHORE = asyncio.Semaphore(OCR_CONCURRENCY)
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "lang": LANG}
+# Load OCR engine once
+ocr = PaddleOCR(use_angle_cls=USE_ANGLE_CLS, lang=LANG)
 
-def pil_from_bytes(data: bytes) -> Image.Image:
-    try:
-        return Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image data")
 
-def run_ocr(img: Image.Image, det=True, rec=True, cls=USE_ANGLE_CLS):
-    # PaddleOCR expects BGR ndarray
-    arr = np.array(img)[:, :, ::-1]
-    result = ocr.ocr(arr, det=det, rec=rec, cls=cls)
-    items = []
-    if result:
-        for line in result:
-            for box, (text, score) in line:
-                items.append({"bbox": box, "text": text, "score": float(score)})
-    return items
-
+# ----------------------------
+# Helpers
+# ----------------------------
 def _pil_from_bytes(data: bytes) -> Image.Image:
     try:
         return Image.open(io.BytesIO(data)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image data")
 
-def _pil_list_from_pdf_bytes(pdf_bytes: bytes, dpi: int = 180, page: Optional[int] = None, max_pages: Optional[int] = None) -> List[Image.Image]:
+
+def _choose_page_indices(doc: fitz.Document, page: Optional[int], max_pages: Optional[int]) -> List[int]:
+    if page is not None:
+        i = page - 1
+        if i < 0 or i >= len(doc):
+            raise HTTPException(status_code=400, detail=f"PDF has {len(doc)} pages; page {page} is out of range")
+        return [i]
+    idxs = list(range(len(doc)))
+    if max_pages:
+        idxs = idxs[:max(0, int(max_pages))]
+    return idxs
+
+
+def _pil_list_from_pdf_bytes(pdf_bytes: bytes, dpi: int = 150,
+                             page: Optional[int] = None, max_pages: Optional[int] = None) -> List[Image.Image]:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid PDF data")
 
     images: List[Image.Image] = []
-
-    # Decide which pages to render
-    if page is not None:
-        # 1-based -> 0-based
-        i = page - 1
-        if i < 0 or i >= len(doc):
-            raise HTTPException(status_code=400, detail=f"PDF has {len(doc)} pages; page {page} is out of range")
-        page_indices = [i]
-    else:
-        page_indices = list(range(len(doc)))
-        if max_pages:
-            page_indices = page_indices[:max_pages]
-
-    # Render pages to PIL Images
-    zoom = dpi / 72.0
-    mtx = fitz.Matrix(zoom, zoom)
-    for i in page_indices:
-        pg = doc.load_page(i)
-        pm = pg.get_pixmap(matrix=mtx, alpha=False)   # RGB
-        img = Image.frombytes("RGB", [pm.width, pm.height], pm.samples)
-        images.append(img)
-
+    try:
+        zoom = (dpi or 150) / 72.0
+        mtx = fitz.Matrix(zoom, zoom)
+        for i in _choose_page_indices(doc, page, max_pages):
+            pg = doc.load_page(i)
+            # Render grayscale to reduce memory; we'll convert to RGB for OCR
+            pm = pg.get_pixmap(matrix=mtx, colorspace=fitz.csGRAY, alpha=False)
+            img = Image.frombytes("L", [pm.width, pm.height], pm.samples).convert("RGB")
+            images.append(img)
+            # free pixmap
+            del pm
+            gc.collect()
+    finally:
+        doc.close()
     return images
 
-def _run_ocr(img: Image.Image, det=True, rec=True, cls=USE_ANGLE_CLS):
-    arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
-    result = ocr.ocr(arr, det=det, rec=rec, cls=cls)
+
+def _downscale_pil(img: Image.Image, max_side: int = OCR_MAX_SIDE) -> Image.Image:
+    w, h = img.size
+    scale = min(1.0, max_side / float(max(w, h)))
+    if scale < 1.0:
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    return img
+
+
+def _ocr_one_image(pil: Image.Image, det=True, rec=True, cls=USE_ANGLE_CLS):
+    pil = _downscale_pil(pil, max_side=OCR_MAX_SIDE)
+    arr = np.asarray(pil)[:, :, ::-1]  # RGB -> BGR
+    out = ocr.ocr(arr, det=det, rec=rec, cls=cls) or []
     items = []
-    if result:
-        for line in result:
-            for box, (text, score) in line:
-                items.append({"bbox": box, "text": text, "score": float(score)})
+    for line in out:
+        for box, (text, score) in line:
+            items.append({"bbox": box, "text": text, "score": float(score)})
+    # free ASAP
+    del arr, out
+    gc.collect()
     return items
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "lang": LANG, "use_angle_cls": USE_ANGLE_CLS, "max_side": OCR_MAX_SIDE}
+
 
 @app.post("/ocr")
 async def ocr_endpoint(
     request: Request,
-    # keep the explicit field for normal clients
+    # typical multipart field for images/files
     image: Optional[UploadFile] = File(default=None),
+    # URL mode (form/json)
     url: Optional[str] = Form(default=None),
+    # OCR flags
     det: Optional[bool] = Form(default=True),
     rec: Optional[bool] = Form(default=True),
     cls: Optional[bool] = Form(default=USE_ANGLE_CLS),
-    page: Optional[int] = Form(default=None),
-    max_pages: Optional[int] = Form(default=None),
-    dpi: Optional[int] = Form(default=180),
+    # PDF controls
+    page: Optional[int] = Form(default=None, description="1-based page number"),
+    max_pages: Optional[int] = Form(default=None, description="limit how many pages to process"),
+    dpi: Optional[int] = Form(default=150, description="PDF rasterization DPI"),
 ):
     ct = (request.headers.get("content-type") or "").lower()
 
-    # 1) JSON mode (URL)
+    # ----- 1) JSON mode (URL) -----
     if image is None and "application/json" in ct:
         data = await request.json()
         url = data.get("url")
@@ -127,59 +152,79 @@ async def ocr_endpoint(
         max_pages = data.get("max_pages", max_pages)
         dpi = data.get("dpi", dpi)
 
-    # 2) Multipart with arbitrary field name (e.g., "data" in n8n)
     uf: Optional[UploadFile] = image
+
+    # ----- 2) Multipart with arbitrary field name ("image", "data", etc.) -----
     if uf is None and "multipart/form-data" in ct:
         form = await request.form()
-        # try common names first
         for key in ("image", "file", "data", "upload"):
-            if key in form and isinstance(form[key], UploadFile):
-                uf = form[key]  # type: ignore[assignment]
+            v = form.get(key)
+            if isinstance(v, UploadFile):
+                uf = v
                 break
-        # else just take the first UploadFile in the form
-        if uf is None:
+        if uf is None:  # take first UploadFile if name unknown
             for v in form.values():
                 if isinstance(v, UploadFile):
                     uf = v
                     break
 
-    # 3) Raw body (application/pdf or image/*)
+    # ----- 3) Raw body (application/pdf or image/*) -----
     if uf is None and ("application/pdf" in ct or ct.startswith("image/")):
         raw = await request.body()
         is_pdf = "application/pdf" in ct
-        if is_pdf:
-            pil_pages = _pil_list_from_pdf_bytes(raw, dpi=dpi or 180, page=page, max_pages=max_pages)
-            pages = []
-            for idx, pil in enumerate(pil_pages, start=1 if page is None else page):
-                pages.append({"page": idx, "items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
-            return JSONResponse({"pages": pages})
-        else:
-            pil = _pil_from_bytes(raw)
-            return JSONResponse({"items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
+        async with OCR_SEMAPHORE:
+            if is_pdf:
+                pages = []
+                for idx, pil in enumerate(_pil_list_from_pdf_bytes(raw, dpi=dpi or 150, page=page, max_pages=max_pages),
+                                          start=1 if page is None else page):
+                    items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
+                    pages.append({"page": idx, "items": items})
+                    del pil
+                    gc.collect()
+                return JSONResponse({"pages": pages})
+            else:
+                pil = _pil_from_bytes(raw)
+                items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
+                del pil
+                gc.collect()
+                return JSONResponse({"items": items})
 
-    # 4) URL mode if provided via form
+    # ----- 4) URL mode (form/json) -----
     if uf is None and url:
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
                 img_bytes = resp.read()
         except Exception:
             raise HTTPException(status_code=400, detail="Failed to fetch image from URL")
-        pil = _pil_from_bytes(img_bytes)
-        return JSONResponse({"items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
+        async with OCR_SEMAPHORE:
+            pil = _pil_from_bytes(img_bytes)
+            items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
+            del pil
+            gc.collect()
+            return JSONResponse({"items": items})
 
-    # 5) Handle the UploadFile (multipart)
+    # ----- 5) Multipart UploadFile path -----
     if uf is not None:
         file_bytes = await uf.read()
         fname = (uf.filename or "").lower()
         is_pdf = ("application/pdf" in (uf.content_type or "").lower()) or fname.endswith(".pdf")
-        if is_pdf:
-            pil_pages = _pil_list_from_pdf_bytes(file_bytes, dpi=dpi or 180, page=page, max_pages=max_pages)
-            pages = []
-            for idx, pil in enumerate(pil_pages, start=1 if page is None else page):
-                pages.append({"page": idx, "items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
-            return JSONResponse({"pages": pages})
-        else:
-            pil = _pil_from_bytes(file_bytes)
-            return JSONResponse({"items": _run_ocr(pil, det=det, rec=rec, cls=cls)})
+        async with OCR_SEMAPHORE:
+            if is_pdf:
+                pages = []
+                for idx, pil in enumerate(
+                    _pil_list_from_pdf_bytes(file_bytes, dpi=dpi or 150, page=page, max_pages=max_pages),
+                    start=1 if page is None else page
+                ):
+                    items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
+                    pages.append({"page": idx, "items": items})
+                    del pil
+                    gc.collect()
+                return JSONResponse({"pages": pages})
+            else:
+                pil = _pil_from_bytes(file_bytes)
+                items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
+                del pil
+                gc.collect()
+                return JSONResponse({"items": items})
 
     raise HTTPException(status_code=400, detail="No image/PDF provided (multipart, raw, or url expected)")

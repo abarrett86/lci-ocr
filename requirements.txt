@@ -1,11 +1,21 @@
 fastapi==0.115.5
 uvicorn[standard]==0.32.0
-paddlepaddle==3.1.1
+
+# OCR stack (PaddleOCR 3.x requires PaddlePaddle 3.x)
 paddleocr==3.2.0
+paddlepaddle==3.1.1
+
+# Imaging / math
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
 Pillow==10.4.0
-pydantic==2.9.2
+
+# PDF rasterization
+PyMuPDF==1.24.8
+
+# FastAPI extras for uploads / async files
 python-multipart==0.0.9
 aiofiles==23.2.1
-PyMuPDF==1.24.8
+
+# Pydantic (FastAPI v0.115 uses pydantic v2)
+pydantic==2.9.2
