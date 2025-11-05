@@ -19,7 +19,7 @@ ENV OMP_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
     UVICORN_WORKERS=1 \
     PADDLEOCR_LANG=en \
-    PADDLEOCR_USE_ANGLE_CLS=true \
+    PADDLEOCR_USE_ANGLE_CLS=false \
     PORT=8080
 
 # Pre-download models so cold starts are faster
