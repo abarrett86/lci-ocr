@@ -25,7 +25,7 @@ ENV OMP_NUM_THREADS=1 \
 # Pre-download models so cold starts are faster
 RUN python - <<'PY'
 from paddleocr import PaddleOCR
-PaddleOCR(use_angle_cls=True, lang="en")
+PaddleOCR(use_angle_cls=False`, lang="en")
 print("PaddleOCR models cached.")
 PY
 
