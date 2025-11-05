@@ -13,7 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from PIL import Image
 import numpy as np
-import fitz  # PyMuPDF
+# --- removed: import fitz  # PyMuPDF
+from pdf2image import convert_from_bytes, pdfinfo_from_bytes  # <-- add this
 from paddleocr import PaddleOCR
 
 
@@ -21,34 +22,27 @@ from paddleocr import PaddleOCR
 # Config / globals
 # ----------------------------
 LANG = os.getenv("PADDLEOCR_LANG", "en")
-# default off (saves RAM); enable via env or form if needed
 USE_ANGLE_CLS = os.getenv("PADDLEOCR_USE_ANGLE_CLS", "false").lower() == "true"
 
-# image caps (can override via env)
-OCR_MAX_SIDE = int(os.getenv("OCR_MAX_SIDE", "1600"))          # max longest edge in pixels
-OCR_MAX_PIXELS = int(os.getenv("OCR_MAX_PIXELS", "3000000"))   # ~3.0 MP cap (e.g., 1732x1732)
+OCR_MAX_SIDE = int(os.getenv("OCR_MAX_SIDE", "1600"))
+OCR_MAX_PIXELS = int(os.getenv("OCR_MAX_PIXELS", "3000000"))
 
-# concurrent in-flight OCR ops in this process
 OCR_CONCURRENCY = int(os.getenv("OCR_CONCURRENCY", "1"))
 
-# keep math libs tame on small dynos
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-# FastAPI app + CORS
 app = FastAPI(title="PaddleOCR REST", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your n8n origin if desired
+    allow_origins=["*"],
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# single-process concurrency guard
 OCR_SEMAPHORE = asyncio.Semaphore(OCR_CONCURRENCY)
 
-# load OCR once (models in memory)
 ocr = PaddleOCR(use_angle_cls=USE_ANGLE_CLS, lang=LANG)
 
 
@@ -62,13 +56,14 @@ def _pil_from_bytes(data: bytes) -> Image.Image:
         raise HTTPException(status_code=400, detail="Invalid image data")
 
 
-def _choose_page_indices(doc: fitz.Document, page: Optional[int], max_pages: Optional[int]) -> List[int]:
+def _choose_page_indices(num_pages: int, page: Optional[int], max_pages: Optional[int]) -> List[int]:
+    """Determine which 0-based page indices to render."""
     if page is not None:
         i = page - 1
-        if i < 0 or i >= len(doc):
-            raise HTTPException(status_code=400, detail=f"PDF has {len(doc)} pages; page {page} is out of range")
+        if i < 0 or i >= num_pages:
+            raise HTTPException(status_code=400, detail=f"PDF has {num_pages} pages; page {page} is out of range")
         return [i]
-    idxs = list(range(len(doc)))
+    idxs = list(range(num_pages))
     if max_pages:
         idxs = idxs[:max(0, int(max_pages))]
     return idxs
@@ -76,27 +71,42 @@ def _choose_page_indices(doc: fitz.Document, page: Optional[int], max_pages: Opt
 
 def _iter_pdf_pages(pdf_bytes: bytes, dpi: int = 120,
                     page: Optional[int] = None, max_pages: Optional[int] = None):
-    """Yield (page_index, PIL RGB) one at a time to keep memory low."""
+    """
+    Yield (page_index, PIL RGB) one page at a time using pdf2image.
+    We render each requested page with its own convert_from_bytes call to keep RAM low.
+    """
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        info = pdfinfo_from_bytes(pdf_bytes)
+        num_pages = int(info.get("Pages", 0))
+        if num_pages <= 0:
+            raise HTTPException(status_code=400, detail="Invalid or empty PDF")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid PDF data")
 
-    try:
-        zoom = (dpi or 120) / 72.0
-        mtx = fitz.Matrix(zoom, zoom)
-        for i in _choose_page_indices(doc, page, max_pages):
-            pg = doc.load_page(i)
-            # grayscale render (smaller) → convert to RGB for OCR
-            pm = pg.get_pixmap(matrix=mtx, colorspace=fitz.csGRAY, alpha=False)
-            pil = Image.frombytes("L", [pm.width, pm.height], pm.samples).convert("RGB")
-            del pm
-            gc.collect()
-            yield (i, pil)
-            del pil
-            gc.collect()
-    finally:
-        doc.close()
+    # Select pages (0-based indices)
+    indices = _choose_page_indices(num_pages, page, max_pages)
+
+    # pdf2image uses 1-based page numbers for first_page/last_page
+    for i in indices:
+        imgs = convert_from_bytes(
+            pdf_bytes,
+            dpi=dpi or 120,
+            first_page=i + 1,
+            last_page=i + 1,
+            fmt="png",           # render via poppler; returns PIL.Image instances
+            grayscale=True,      # smaller & fine for OCR; convert to RGB below
+            thread_count=1       # be nice if running multiple requests
+        )
+        if not imgs:
+            continue
+        pil = imgs[0]
+        # ensure RGB for OCR (Paddle expects BGR array later)
+        if pil.mode != "RGB":
+            pil = pil.convert("RGB")
+        yield (i, pil)
+        # cleanup
+        del pil, imgs
+        gc.collect()
 
 
 def _downscale_max_side(pil: Image.Image, max_side: int = OCR_MAX_SIDE) -> Image.Image:
@@ -118,7 +128,6 @@ def _cap_pixels(pil: Image.Image, max_pixels: int = OCR_MAX_PIXELS) -> Image.Ima
 
 
 def _ocr_one_image(pil: Image.Image, det=True, rec=True, cls=USE_ANGLE_CLS):
-    # shrink aggressively before creating ndarray
     pil = _downscale_max_side(pil, OCR_MAX_SIDE)
     pil = _cap_pixels(pil, OCR_MAX_PIXELS)
     arr = np.asarray(pil)[:, :, ::-1]  # RGB -> BGR
@@ -127,7 +136,6 @@ def _ocr_one_image(pil: Image.Image, det=True, rec=True, cls=USE_ANGLE_CLS):
     for line in out:
         for box, (text, score) in line:
             items.append({"bbox": box, "text": text, "score": float(score)})
-    # free ASAP
     del arr, out
     gc.collect()
     return items
@@ -151,15 +159,11 @@ def healthz():
 @app.post("/ocr")
 async def ocr_endpoint(
     request: Request,
-    # typical multipart field for images/files
     image: Optional[UploadFile] = File(default=None),
-    # URL mode (form/json)
     url: Optional[str] = Form(default=None),
-    # OCR flags
     det: Optional[bool] = Form(default=True),
     rec: Optional[bool] = Form(default=True),
     cls: Optional[bool] = Form(default=USE_ANGLE_CLS),
-    # PDF controls
     page: Optional[int] = Form(default=None, description="1-based page number"),
     max_pages: Optional[int] = Form(default=None, description="limit how many pages to process"),
     dpi: Optional[int] = Form(default=120, description="PDF rasterization DPI"),
@@ -179,7 +183,7 @@ async def ocr_endpoint(
 
     uf: Optional[UploadFile] = image
 
-    # ----- 2) Multipart with arbitrary field name ("image", "file", "data", "upload") -----
+    # ----- 2) Multipart with arbitrary field name -----
     if uf is None and "multipart/form-data" in ct:
         form = await request.form()
         for key in ("image", "file", "data", "upload"):
@@ -187,7 +191,7 @@ async def ocr_endpoint(
             if isinstance(v, UploadFile):
                 uf = v
                 break
-        if uf is None:  # take first UploadFile if name unknown
+        if uf is None:
             for v in form.values():
                 if isinstance(v, UploadFile):
                     uf = v

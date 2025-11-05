@@ -19,3 +19,5 @@ aiofiles==23.2.1
 
 # Pydantic (FastAPI v0.115 uses pydantic v2)
 pydantic==2.9.2
+
+pdf2image>=1.17.0
