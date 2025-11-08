@@ -170,60 +170,60 @@ async def ocr_endpoint(
 ):
     ct = (request.headers.get("content-type") or "").lower()
 
-    # # ----- 1) JSON mode (URL) -----
-    # if image is None and "application/json" in ct:
-    #     data = await request.json()
-    #     url = data.get("url")
-    #     det = data.get("det", det)
-    #     rec = data.get("rec", rec)
-    #     cls = data.get("cls", cls)
-    #     page = data.get("page", page)
-    #     max_pages = data.get("max_pages", max_pages)
-    #     dpi = data.get("dpi", dpi)
+    # ----- 1) JSON mode (URL) -----
+    if image is None and "application/json" in ct:
+        data = await request.json()
+        url = data.get("url")
+        det = data.get("det", det)
+        rec = data.get("rec", rec)
+        cls = data.get("cls", cls)
+        page = data.get("page", page)
+        max_pages = data.get("max_pages", max_pages)
+        dpi = data.get("dpi", dpi)
 
-    # uf: Optional[UploadFile] = image
+    uf: Optional[UploadFile] = image
 
-    # # ----- 2) Multipart with arbitrary field name -----
-    # if uf is None and "multipart/form-data" in ct:
-    #     form = await request.form()
-    #     for key in ("image", "file", "data", "upload"):
-    #         v = form.get(key)
-    #         if isinstance(v, UploadFile):
-    #             uf = v
-    #             break
-    #     if uf is None:
-    #         for v in form.values():
-    #             if isinstance(v, UploadFile):
-    #                 uf = v
-    #                 break
+    # ----- 2) Multipart with arbitrary field name -----
+    if uf is None and "multipart/form-data" in ct:
+        form = await request.form()
+        for key in ("image", "file", "data", "upload"):
+            v = form.get(key)
+            if isinstance(v, UploadFile):
+                uf = v
+                break
+        if uf is None:
+            for v in form.values():
+                if isinstance(v, UploadFile):
+                    uf = v
+                    break
 
-    # # ----- 3) Raw body (application/pdf or image/*) -----
-    # if uf is None and ("application/pdf" in ct or ct.startswith("image/")):
-    #     raw = await request.body()
-    #     is_pdf = "application/pdf" in ct
-    #     async with OCR_SEMAPHORE:
-    #         if is_pdf:
-    #             pages = []
-    #             for idx, pil in _iter_pdf_pages(raw, dpi=dpi or 120, page=page, max_pages=max_pages):
-    #                 items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
-    #                 pages.append({"page": idx + 1, "items": items})
-    #             return JSONResponse({"pages": pages})
-    #         else:
-    #             pil = _pil_from_bytes(raw)
-    #             items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
-    #             return JSONResponse({"items": items})
+    # ----- 3) Raw body (application/pdf or image/*) -----
+    if uf is None and ("application/pdf" in ct or ct.startswith("image/")):
+        raw = await request.body()
+        is_pdf = "application/pdf" in ct
+        async with OCR_SEMAPHORE:
+            if is_pdf:
+                pages = []
+                for idx, pil in _iter_pdf_pages(raw, dpi=dpi or 120, page=page, max_pages=max_pages):
+                    items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
+                    pages.append({"page": idx + 1, "items": items})
+                return JSONResponse({"pages": pages})
+            else:
+                pil = _pil_from_bytes(raw)
+                items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
+                return JSONResponse({"items": items})
 
-    # # ----- 4) URL mode (form/json) -----
-    # if uf is None and url:
-    #     try:
-    #         with urllib.request.urlopen(url, timeout=10) as resp:
-    #             img_bytes = resp.read()
-    #     except Exception:
-    #         raise HTTPException(status_code=400, detail="Failed to fetch image from URL")
-    #     async with OCR_SEMAPHORE:
-    #         pil = _pil_from_bytes(img_bytes)
-    #         items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
-    #         return JSONResponse({"items": items})
+    # ----- 4) URL mode (form/json) -----
+    if uf is None and url:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                img_bytes = resp.read()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Failed to fetch image from URL")
+        async with OCR_SEMAPHORE:
+            pil = _pil_from_bytes(img_bytes)
+            items = _ocr_one_image(pil, det=det, rec=rec, cls=cls)
+            return JSONResponse({"items": items})
 
     # ----- 5) Multipart UploadFile path -----
     if uf is not None:
