@@ -210,6 +210,48 @@ def healthz():
         "max_pixels": OCR_MAX_PIXELS,
         "concurrency": OCR_CONCURRENCY,
     }
+    
+async def log_request(request: Request):
+    log.info("----- Incoming Request -----")
+    log.info("URL: %s %s", request.method, request.url)
+    log.info("Headers: %s", dict(request.headers))
+
+    ct = request.headers.get("content-type", "").lower()
+
+    if "application/json" in ct:
+        try:
+            body = await request.json()
+            log.info("JSON Body: %s", body)
+        except Exception as e:
+            log.warning("JSON parse failed: %s", e)
+
+    elif "multipart/form-data" in ct:
+        try:
+            form = await request.form()
+            form_dict = {}
+            for k, v in form.items():
+                if isinstance(v, UploadFile):
+                    form_dict[k] = {
+                        "filename": v.filename,
+                        "content_type": v.content_type,
+                        "size": "binary"
+                    }
+                else:
+                    form_dict[k] = v
+            log.info("Form Data: %s", form_dict)
+        except Exception as e:
+            log.warning("Form parse failed: %s", e)
+
+    elif "application/x-www-form-urlencoded" in ct:
+        form = await request.form()
+        log.info("Form URL Encoded: %s", dict(form))
+
+    else:
+        # For raw uploads (pdf/image)
+        body = await request.body()
+        log.info("Raw Body Bytes: %s", len(body))
+
+    log.info("----- End Request -----")
 
 @app.post("/ocr")
 async def ocr_endpoint(
@@ -223,10 +265,13 @@ async def ocr_endpoint(
     max_pages: Optional[int] = Form(default=None, description="limit how many pages to process"),
     dpi: Optional[int] = Form(default=120, description="PDF rasterization DPI"),
 ):
+    await log_request(request)
     ct = (request.headers.get("content-type") or "").lower()
     log.info("POST /ocr | ct=%s det=%s rec=%s cls=%s page=%s max_pages=%s dpi=%s",
              ct, det, rec, cls, page, max_pages, dpi)
     _log_mem("enter /ocr")
+    
+    
 
     # ----- 1) JSON mode (URL) -----
     if image is None and "application/json" in ct:
