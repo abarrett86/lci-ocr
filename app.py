@@ -74,14 +74,28 @@ app.add_middleware(
 
 OCR_SEMAPHORE = asyncio.Semaphore(OCR_CONCURRENCY)
 
-log.info("Starting app | lang=%s use_angle_cls=%s max_side=%s max_pixels=%s concurrency=%s",
-         LANG, USE_ANGLE_CLS, OCR_MAX_SIDE, OCR_MAX_PIXELS, OCR_CONCURRENCY)
+log.info(
+    "Starting app | lang=%s use_angle_cls=%s max_side=%s max_pixels=%s concurrency=%s",
+    LANG, USE_ANGLE_CLS, OCR_MAX_SIDE, OCR_MAX_PIXELS, OCR_CONCURRENCY
+)
 _log_mem("post-init")
 
-t0 = time.perf_counter()
-ocr = PaddleOCR(use_angle_cls=USE_ANGLE_CLS, lang=LANG)
-log.info("PaddleOCR initialized in %.2fs", time.perf_counter() - t0)
-_log_mem("after PaddleOCR init")
+# ----------------------------
+# Lazy OCR loader (v2.7 friendly, low idle RAM)
+# ----------------------------
+_OCR = None
+def _get_ocr() -> PaddleOCR:
+    global _OCR
+    if _OCR is None:
+        t0 = time.perf_counter()
+        _OCR = PaddleOCR(
+            use_angle_cls=USE_ANGLE_CLS,
+            lang=LANG,
+            use_gpu=False,  # force CPU on Heroku
+        )
+        log.info("PaddleOCR initialized in %.2fs", time.perf_counter() - t0)
+        _log_mem("after PaddleOCR init")
+    return _OCR
 
 # ----------------------------
 # Helpers
@@ -184,7 +198,7 @@ def _ocr_one_image(pil: Image.Image, det=True, rec=True, cls=USE_ANGLE_CLS):
     pil = _downscale_max_side(pil, OCR_MAX_SIDE)
     pil = _cap_pixels(pil, OCR_MAX_PIXELS)
     arr = np.asarray(pil)[:, :, ::-1]  # RGB -> BGR
-    out = ocr.ocr(arr, det=det, rec=rec, cls=cls) or []
+    out = _get_ocr().ocr(arr, det=det, rec=rec, cls=cls) or []
     dt = time.perf_counter() - t
     log.info("OCR done in %.2fs | lines=%s", dt, sum(len(line) for line in out))
     items = []
@@ -210,7 +224,7 @@ def healthz():
         "max_pixels": OCR_MAX_PIXELS,
         "concurrency": OCR_CONCURRENCY,
     }
-    
+
 async def log_request(request: Request):
     log.info("----- Incoming Request -----")
     log.info("URL: %s %s", request.method, request.url)
@@ -267,11 +281,11 @@ async def ocr_endpoint(
 ):
     await log_request(request)
     ct = (request.headers.get("content-type") or "").lower()
-    log.info("POST /ocr | ct=%s det=%s rec=%s cls=%s page=%s max_pages=%s dpi=%s",
-             ct, det, rec, cls, page, max_pages, dpi)
+    log.info(
+        "POST /ocr | ct=%s det=%s rec=%s cls=%s page=%s max_pages=%s dpi=%s",
+        ct, det, rec, cls, page, max_pages, dpi
+    )
     _log_mem("enter /ocr")
-    
-    
 
     # ----- 1) JSON mode (URL) -----
     if image is None and "application/json" in ct:
