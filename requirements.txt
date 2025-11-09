@@ -10,7 +10,7 @@ numpy==1.26.4
 Pillow==10.4.0
 
 # PDF rasterization
-PyMuPDF==1.24.8
+PyMuPDF==1.21.0
 
 # FastAPI extras for uploads / async files
 python-multipart==0.0.9
