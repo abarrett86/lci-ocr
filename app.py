@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from PIL import Image
 import numpy as np
-from pdf2image import convert_from_bytes, pdfinfo_from_bytes
+import fitz  # PyMuPDF
 from paddleocr import PaddleOCR
 
 # ----------------------------
@@ -59,15 +59,15 @@ OCR_MAX_SIDE = int(os.getenv("OCR_MAX_SIDE", "1600"))
 OCR_MAX_PIXELS = int(os.getenv("OCR_MAX_PIXELS", "3000000"))
 OCR_CONCURRENCY = int(os.getenv("OCR_CONCURRENCY", "1"))
 
-# Limit BLAS threads
+# Limit BLAS threads (keeps RAM/CPU stable on small dynos)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-app = FastAPI(title="PaddleOCR REST", version="1.1.0")
+app = FastAPI(title="PaddleOCR REST", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],           # tighten to your n8n origin if desired
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -78,12 +78,13 @@ log.info(
     "Starting app | lang=%s use_angle_cls=%s max_side=%s max_pixels=%s concurrency=%s",
     LANG, USE_ANGLE_CLS, OCR_MAX_SIDE, OCR_MAX_PIXELS, OCR_CONCURRENCY
 )
-_log_mem("post-init")
+_ = _log_mem("post-init")
 
 # ----------------------------
 # Lazy OCR loader (v2.7 friendly, low idle RAM)
 # ----------------------------
-_OCR = None
+_OCR: Optional[PaddleOCR] = None
+
 def _get_ocr() -> PaddleOCR:
     global _OCR
     if _OCR is None:
@@ -110,85 +111,58 @@ def _pil_from_bytes(data: bytes) -> Image.Image:
         log.exception("Invalid image data: %s", e)
         raise HTTPException(status_code=400, detail="Invalid image data")
 
-def _choose_page_indices(num_pages: int, page: Optional[int], max_pages: Optional[int]) -> List[int]:
-    log.debug("Choosing page indices | num_pages=%s page=%s max_pages=%s", num_pages, page, max_pages)
+def _choose_page_indices(total_pages: int, page: Optional[int], max_pages: Optional[int]) -> List[int]:
     if page is not None:
         i = page - 1
-        if i < 0 or i >= num_pages:
-            log.error("Page out of range | num_pages=%s requested=%s", num_pages, page)
-            raise HTTPException(status_code=400, detail=f"PDF has {num_pages} pages; page {page} is out of range")
+        if i < 0 or i >= total_pages:
+            raise HTTPException(status_code=400, detail=f"PDF has {total_pages} pages; page {page} is out of range")
         return [i]
-    idxs = list(range(num_pages))
+    idxs = list(range(total_pages))
     if max_pages:
         idxs = idxs[:max(0, int(max_pages))]
-    log.debug("Selected indices=%s", idxs)
     return idxs
 
 def _iter_pdf_pages(pdf_bytes: bytes, dpi: int = 120,
                     page: Optional[int] = None, max_pages: Optional[int] = None):
     """
-    Yield (page_index, PIL RGB) one page at a time using pdf2image.
+    Yield (page_index, PIL RGB) one page at a time using PyMuPDF (fitz).
+    Grayscale render (smaller) → convert to RGB for OCR.
     """
-    log.info("Parsing PDF info | bytes=%s", len(pdf_bytes))
-    _log_mem("before pdfinfo")
     try:
-        info = pdfinfo_from_bytes(pdf_bytes)
-        num_pages = int(info.get("Pages", 0))
-        log.info("PDF info | pages=%s", num_pages)
-        if num_pages <= 0:
-            raise HTTPException(status_code=400, detail="Invalid or empty PDF")
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("Invalid PDF data: %s", e)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid PDF data")
 
-    indices = _choose_page_indices(num_pages, page, max_pages)
-
-    for i in indices:
-        t = time.perf_counter()
-        _log_mem(f"before convert page {i+1}")
-        imgs = convert_from_bytes(
-            pdf_bytes,
-            dpi=dpi or 120,
-            first_page=i + 1,
-            last_page=i + 1,
-            fmt="png",
-            grayscale=True,
-            thread_count=1
-        )
-        log.info("Rendered page %s -> %s image(s) in %.2fs", i + 1, len(imgs), time.perf_counter() - t)
-        if not imgs:
-            log.warning("No image returned for page %s", i + 1)
-            continue
-        pil = imgs[0]
-        if pil.mode != "RGB":
-            pil = pil.convert("RGB")
-        log.debug("Page %s PIL | size=%s mode=%s", i + 1, pil.size, pil.mode)
-        yield (i, pil)
-        del pil, imgs
-        gc.collect()
-        _log_mem(f"after convert page {i+1}")
+    try:
+        zoom = (dpi or 120) / 72.0
+        mtx = fitz.Matrix(zoom, zoom)
+        indices = _choose_page_indices(len(doc), page, max_pages)
+        for i in indices:
+            pg = doc.load_page(i)
+            pm = pg.get_pixmap(matrix=mtx, colorspace=fitz.csGRAY, alpha=False)
+            pil = Image.frombytes("L", [pm.width, pm.height], pm.samples).convert("RGB")
+            del pm
+            gc.collect()
+            yield (i, pil)
+            del pil
+            gc.collect()
+    finally:
+        doc.close()
 
 def _downscale_max_side(pil: Image.Image, max_side: int = OCR_MAX_SIDE) -> Image.Image:
     w, h = pil.size
     scale = min(1.0, max_side / float(max(w, h)))
-    log.debug("_downscale_max_side | in=%sx%s scale=%.4f", w, h, scale)
     if scale < 1.0:
         pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
-        log.debug("_downscale_max_side | out=%sx%s", *pil.size)
     return pil
 
 def _cap_pixels(pil: Image.Image, max_pixels: int = OCR_MAX_PIXELS) -> Image.Image:
     w, h = pil.size
     cur = w * h
     if cur <= max_pixels:
-        log.debug("_cap_pixels | ok cur=%s <= max=%s", cur, max_pixels)
         return pil
     scale = (max_pixels / float(cur)) ** 0.5
-    log.debug("_cap_pixels | in_pixels=%s scale=%.4f", cur, scale)
     pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
-    log.debug("_cap_pixels | out=%sx%s", *pil.size)
     return pil
 
 def _ocr_one_image(pil: Image.Image, det=True, rec=True, cls=USE_ANGLE_CLS):
@@ -230,7 +204,7 @@ async def log_request(request: Request):
     log.info("URL: %s %s", request.method, request.url)
     log.info("Headers: %s", dict(request.headers))
 
-    ct = request.headers.get("content-type", "").lower()
+    ct = (request.headers.get("content-type") or "").lower()
 
     if "application/json" in ct:
         try:
@@ -257,8 +231,11 @@ async def log_request(request: Request):
             log.warning("Form parse failed: %s", e)
 
     elif "application/x-www-form-urlencoded" in ct:
-        form = await request.form()
-        log.info("Form URL Encoded: %s", dict(form))
+        try:
+            form = await request.form()
+            log.info("Form URL Encoded: %s", dict(form))
+        except Exception as e:
+            log.warning("Form-URL-Encoded parse failed: %s", e)
 
     else:
         # For raw uploads (pdf/image)
